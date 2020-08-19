@@ -160,7 +160,6 @@ def main(argv=None):
             atlas_shape = nib.load(atlas.maps).shape
             atlas_affine = nib.load(atlas.maps).affine
             atlas_data = nib.load(atlas.maps).get_fdata()
-            print(len(np.unique(atlas_data)))
         elif args.atlas == 'msdl':
             print("Parcellating using the MSDL Atlas")
             atlas = datasets.fetch_atlas_msdl()
@@ -170,21 +169,11 @@ def main(argv=None):
                                    memory='nilearn_cache')
         time_series = masker.fit_transform(imgs)
 
-        #from nilearn.connectome import ConnectivityMeasure
-        #print("Calculating correlation matrix")
-        #correlation_measure = ConnectivityMeasure(kind='correlation')
-        #correlation_matrix = correlation_measure.fit_transform([time_series])[0]
-
-        # Mask the main diagonal for visualization:
-        #plotting.plot_matrix(correlation_matrix, figure=(10, 8), labels=atlas_labels,
-        #                    reorder=True)
-        #plt.savefig(op.join(workdir, 'correlation_matrix.png'))
-
     print('Performing gradient analysis')
 
     optimal_grad_all = []
     lambdas_all = []
-    #grads_all = []
+    grads_all = []
 
     affinity_name = 'affinity-{0}'.format(args.affinity_kernel)
     approach_name = 'approach-{0}'.format(args.approach)
@@ -207,7 +196,7 @@ def main(argv=None):
 
             lambdas_all.append(gm.lambdas_)
             optimal_grad_all.append(optimal_num_gradients)
-            #grads_all.append(gm.gradients_)
+            grads_all.append(gm.gradients_)
 
             print('Optimal number of gradients is {0} for sparsity {1}'.format(optimal_num_gradients, tmp_thresh))
 
@@ -244,26 +233,19 @@ def main(argv=None):
         sparsity_name = 'sparsity-None'
 
 
-    #optimal_grads = grads_all[maxvar_sparsity]
+    optimal_grads = grads_all[maxvar_sparsity]
     # map the gradient to the parcels
-    gm = GradientMaps(n_components=mode_optimal_num_gradients, random_state=0, kernel=args.affinity_kernel, approach=args.approach)
-    #gm.fit(correlation_matrix, sparsity=maxvar_sparsity/10, n_iter=100)
-    if args.atlas is not None:
-        gm.fit(time_series, sparsity=maxvar_sparsity/10, n_iter=100)
-    else:
-        gm.fit(time_series, sparsity=None, n_iter=100)
     for i in range(mode_optimal_num_gradients):
         if args.atlas is not None:
             tmpimg = np.zeros(atlas_shape)
             for j, n in enumerate(np.unique(atlas_data)[1:]):
                 inds = atlas_data == n
-                #tmpimg[inds] = optimal_grads[j,i]
-                tmpimg[inds] = gm.gradients_[j,i]
+                tmpimg[inds] = optimal_grads[j,i]
                 nib.save(nib.Nifti1Image(tmpimg, atlas_affine), op.join(workdir, 'gradient-{0}.nii.gz'.format(i)))
         else:
             tmpimg = np.zeros(np.prod(dset.masker.mask_img.shape))
             inds = np.ravel_multi_index(np.nonzero(dset.masker.mask_img.get_fdata()), dset.masker.mask_img.shape)
-            tmpimg[inds] = gm.gradients_[:,i]
+            tmpimg[inds] = optimal_grads_[:,i]
             nib.save(nib.Nifti1Image(np.reshape(tmpimg, dset.masker.mask_img.shape), dset.masker.mask_img.affine), op.join(workdir, 'gradient-{0}.nii.gz'.format(i)))
 
         os.system('python3 /Users/miriedel/Desktop/GitHub/surflay/make_figures.py '
