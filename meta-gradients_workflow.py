@@ -248,9 +248,6 @@ def main(argv=None):
             tmpimg[inds] = optimal_grads_[:,i]
             nib.save(nib.Nifti1Image(np.reshape(tmpimg, dset.masker.mask_img.shape), dset.masker.mask_img.affine), op.join(workdir, 'gradient-{0}.nii.gz'.format(i)))
 
-        os.system('python3 /Users/miriedel/Desktop/GitHub/surflay/make_figures.py '
-                  '-f {grad_image} --colormap jet'.format(grad_image = op.join(workdir, 'gradient-{0}.nii.gz'.format(i))))
-
     output_dir = op.join(args.outdir, '{dataset_name}_{atlas_name}_{kernel_name}_{sparsity_name}_{gradients_name}_{affinity_name}_{approach_name}'.format(
                                         dataset_name=dataset_name,
                                         atlas_name=atlas_name,
