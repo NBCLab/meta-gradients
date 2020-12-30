@@ -9,40 +9,27 @@ import nibabel as nib
 import numpy as np
 import shutil
 from nilearn import plotting
-import matplotlib.pyplot as plt
 from nilearn import datasets
 from nimare.io import convert_sleuth_to_dataset
-from neurosynth.base.dataset import download
-from nimare.io import convert_neurosynth_to_dataset
-from brainspace.gradient import GradientMaps
+from nilearn.input_data import NiftiLabelsMasker
 from nimare.dataset import Dataset
 from nimare.meta.kernel import ALEKernel
-import pickle
 from nilearn.connectome import ConnectivityMeasure
+import pickle
 from nilearn import surface
 from nilearn.datasets import fetch_surf_fsaverage
-
-
-def neurosynth_download(ns_data_dir):
-
-    dataset_file = op.join(ns_data_dir, 'neurosynth_dataset.pkl.gz')
-
-    os.makedirs(ns_data_dir, exist_ok=True)
-
-    download(ns_data_dir, unpack=True)
-    ###############################################################################
-    # Convert Neurosynth database to NiMARE dataset file
-    # --------------------------------------------------
-    dset = convert_neurosynth_to_dataset(
-        op.join(ns_data_dir, 'database.txt'),
-        op.join(ns_data_dir, 'features.txt'))
-    dset.save(dataset_file)
+from mapalign import embed
+from nilearn import masking
+import utils
+from glob import glob
 
 
 def get_parser():
     parser = argparse.ArgumentParser(description='This script will generate axials, surface medial and surface lateral view images with the specified overlay.')
     parser.add_argument('--neurosynth', required=False, dest='neurosynth', action='store_true',
                         help=('Query the Neurosynth database.'))
+    parser.add_argument('--subcortical', required=False, dest='subcort', action='store_true', default=False,
+                        help=('Whether to include the subcortical voxels.'))
     parser.add_argument('--nimare-dataset', required=False, dest='nimare_dataset', default=None,
                         help=('Import a NiMARE dataset.'))
     parser.add_argument('--neurosynth-file', required=False, dest='neurosynth_file',
@@ -53,24 +40,20 @@ def get_parser():
                         help='Full path to roi mask for selecting studies.')
     parser.add_argument('--approach', required=False, dest='approach', default='dm',
                         help='Embedding approach for gradients.')
-    parser.add_argument('--affinity-kernel', required=False, dest='affinity_kernel', default=None,
+    parser.add_argument('--affinity', required=False, dest='affinity', default='cosine',
                         help='Kernel function to build the affinity matrix.')
     parser.add_argument('--term', required=False, dest='term',
                         help='Term or list of terms (e.g. [\'load\', \'rest\'] for selecting studies.')
-    parser.add_argument('--kernel', required=False, dest='kernel', default=None,
+    parser.add_argument('--topic', required=False, dest='topic', nargs='*',
+                        help='Topic or list of topics (e.g. [\'topic002\', \'topic023\'] for selecting studies.')
+    parser.add_argument('--kernel', required=False, dest='kernel', default='alekernel',
                         help='Kernel for converting peaks.')
-    parser.add_argument('--fmri-data', required=False, dest='fmri_data',
-                        help='Full path to fMRI data.')
-    parser.add_argument('--atlas', required=False, dest='atlas', default=None,
-                        help='Atlas name for parcellating data: harvard-oxford, aal, craddock-2012, destrieux-2009, msdl.')
-    parser.add_argument('--components', required=False, dest='components', default=None,
-                        help='Number of components to produce.')
-    parser.add_argument('--sparsity', required=False, dest='sparsity', default=None,
-                        help='Sparsity for thresholding connectivity matrix. '
-                        'If not used, but atlas is provided, will search a range'
-                        'of sparsity thresholds for best answer.')
-    parser.add_argument('--prefix', required=False, dest='prefix',
-                        help='prefix name.')
+    parser.add_argument('--atlas', required=False, dest='atlas', default='fsaverage5',
+                        help='Atlas name for parcellating data: harvard-oxford, aal, craddock-2012, destrieux-2009, msdl, fsaverage5 (surface), hcp (surface)')
+    parser.add_argument('--gradients', required=False, dest='gradients', default=None,
+                        help='Number of gradients to produce.')
+    parser.add_argument('--sparsity', required=False, dest='sparsity', default=0.9,
+                        help='Sparsity for thresholding connectivity matrix.')
     parser.add_argument('-w', '--workdir', required=False, dest='workdir',
                         help='Path to working directory.')
     parser.add_argument('-o', '--outdir', required=False, dest='outdir',
@@ -89,6 +72,13 @@ def main(argv=None):
 
     atlas_name = 'atlas-{0}'.format(args.atlas)
     kernel_name = 'kernel-{0}'.format(args.kernel)
+    sparsity_name = 'sparsity-{0}'.format(args.sparsity)
+    affinity_name = 'affinity-{0}'.format(args.affinity)
+    approach_name = 'approach-{0}'.format(args.approach)
+    gradients_name = 'gradients-{0}'.format(args.gradients)
+    subcortical_name='subcortical-{0}'.format(args.subcort)
+
+    dset=None
 
     #handle neurosynth dataset, if called
     if args.neurosynth == True:
@@ -98,12 +88,13 @@ def main(argv=None):
             dataset_file = op.join(ns_data_dir, 'neurosynth_dataset.pkl.gz')
             # download neurosynth dataset if necessary
             if not op.isfile(dataset_file):
-                neurosynth_download(ns_data_dir)
+                utils.neurosynth_download(ns_data_dir)
 
         else:
             dataset_file = args.neurosynth_file
 
         dset = Dataset.load(dataset_file)
+        dataset_name = 'dataset-neurosynth'
 
     #handle sleuth text file, if called
     if args.sleuth_file is not None:
@@ -114,217 +105,316 @@ def main(argv=None):
         dset = Dataset.load(args.nimare_dataset)
         dataset_name = 'dataset-{0}'.format(op.basename(args.nimare_dataset).split('.')[0])
 
-    #slice studies, if needed
-    if args.roi_mask is not None:
-        roi_ids = dset.get_studies_by_mask(args.roi_mask)
-        print('{}/{} studies report at least one coordinate in the '
-            'ROI'.format(len(roi_ids), len(dset.ids)))
-        dset_sel = dset.slice(roi_ids)
-        dset = dset_sel
-        dataset_name = 'dataset-neurosynth_mask-{0}'.format(op.basename(args.roi_mask).split('.')[0])
+    if dset:
+        #slice studies, if needed
+        if args.roi_mask is not None:
+            roi_ids = dset.get_studies_by_mask(args.roi_mask)
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write('{}/{} studies report at least one coordinate in the '
+                    'ROI\n'.format(len(roi_ids), len(dset.ids)))
+            dset_sel = dset.slice(roi_ids)
+            dset = dset_sel
+            dataset_name = 'dataset-neurosynth_mask-{0}'.format(op.basename(args.roi_mask).split('.')[0])
 
-    if args.term is not None:
-        labels = ['Neurosynth_TFIDF__{label}'.format(label=label) for label in [args.term]]
-        term_ids = dset.get_studies_by_label(labels=labels, label_threshold=0.1)
-        print('{}/{} studies report association '
-            'with the term {}'.format(len(term_ids), len(dset.ids), args.term))
-        dset_sel = dset.slice(term_ids)
-        dset = dset_sel
-        img_inds = np.nonzero(dset.masker.mask_img.get_fdata())
-        vox_locs = np.unravel_index(img_inds, dset.masker.mask_img.shape)
-        dataset_name = 'dataset-neurosynth_term-{0}'.format(args.term)
+        if args.term is not None:
+            labels = ['Neurosynth_TFIDF__{label}'.format(label=label) for label in [args.term]]
+            term_ids = dset.get_studies_by_label(labels=labels, label_threshold=0.1)
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write('{}/{} studies report association '
+                    'with the term {}\n'.format(len(term_ids), len(dset.ids), args.term))
+            dset_sel = dset.slice(term_ids)
+            dset = dset_sel
+            img_inds = np.nonzero(dset.masker.mask_img.get_fdata())
+            vox_locs = np.unravel_index(img_inds, dset.masker.mask_img.shape)
+            dataset_name = 'dataset-neurosynth_term-{0}'.format(args.term)
 
-    if (args.neurosynth == True) or (args.sleuth_file is not None) or (args.nimare_dataset is not None):
-        if args.kernel == 'peaks2maps':
-            print("Running peak2maps")
-            k = Peaks2MapsKernel(resample_to_mask=True)
-        elif args.kernel == 'alekernel':
-            print("Running alekernel")
-            k = ALEKernel(fwhm=15)
-        if args.atlas is not None:
-            imgs = k.transform(dset, return_type='image')
-        else:
-            time_series = np.transpose(k.transform(dset, return_type='array'))
+        if args.topic is not None:
+            topics = ['Neurosynth_{version}__{topic}'.format(version=args.topic[0], topic=topic) for topic in args.topic[1:]]
+            topics_ids = []
+            for topic in topics:
+                topic_ids = dset.annotations.id[np.where(dset.annotations[topic])[0]].tolist()
+                topics_ids.extend(topic_ids)
+                with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                    fo.write('{}/{} studies report association '
+                        'with the term {}\n'.format(len(topic_ids), len(dset.ids), topic))
+            topics_ids_unique = np.unique(topics_ids)
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write('{} unique ids\n'.format(len(topics_ids_unique)))
+            dset_sel = dset.slice(topics_ids_unique)
+            dset = dset_sel
+            img_inds = np.nonzero(dset.masker.mask_img.get_fdata())
+            vox_locs = np.unravel_index(img_inds, dset.masker.mask_img.shape)
+            dataset_name = 'dataset-neurosynth_topic-{0}'.format('_'.join(args.topic[1:]))
 
-    elif args.fmri_data is not None:
-        imgs = nib.load(args.fmri_data).get_fdata()
+        if (args.neurosynth == True) or (args.sleuth_file is not None) or (args.nimare_dataset is not None):
+            if args.kernel == 'peaks2maps':
+                with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                    fo.write("Running peak2maps\n")
+                k = Peaks2MapsKernel(resample_to_mask=True)
+            elif args.kernel == 'alekernel':
+                with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                    fo.write("Running alekernel\n")
+                k = ALEKernel(fwhm=15)
+            if args.atlas is not None:
+                imgs = k.transform(dset, return_type='image')
+            else:
+                time_series = np.transpose(k.transform(dset, return_type='array'))
 
     if args.atlas is not None:
         if args.atlas == 'harvard-oxford':
-            print("Parcellating using the Harvard Oxford Atlas")
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write("Parcellating using the Harvard Oxford Atlas\n")
             atlas_labels = atlas.labels[1:]
             atlas_shape = atlas.maps.shape
             atlas_affine = atlas.maps.affine
             atlas_data = atlas.maps.get_fdata()
         elif args.atlas == 'aal':
-            print("Parcellating using the AAL Atlas")
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write("Parcellating using the AAL Atlas\n")
             atlas = datasets.fetch_atlas_aal()
             atlas_labels = atlas.labels
             atlas_shape = nib.load(atlas.maps).shape
             atlas_affine = nib.load(atlas.maps).affine
             atlas_data = nib.load(atlas.maps).get_fdata()
         elif args.atlas == 'craddock-2012':
-            print("Parcellating using the Craddock-2012 Atlas")
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write("Parcellating using the Craddock-2012 Atlas\n")
             atlas = datasets.fetch_atlas_craddock_2012()
         elif args.atlas == 'destrieux-2009':
-            print("Parcellating using the Destrieux-2009 Atlas")
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write("Parcellating using the Destrieux-2009 Atlas\n")
             atlas = datasets.fetch_atlas_destrieux_2009(lateralized=True)
             atlas_labels = atlas.labels[3:]
             atlas_shape = nib.load(atlas.maps).shape
             atlas_affine = nib.load(atlas.maps).affine
             atlas_data = nib.load(atlas.maps).get_fdata()
         elif args.atlas == 'msdl':
-            print("Parcellating using the MSDL Atlas")
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write("Parcellating using the MSDL Atlas\n")
             atlas = datasets.fetch_atlas_msdl()
         elif args.atlas == 'surface':
-            print("Generating surface vertices")
-            atlas_shape = dset.masker.mask_img.shape
-            atlas_affine = dset.masker.mask_img.affine
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write("Generating surface vertices\n")
 
-        if args.atlas != "surface":
-            from nilearn.input_data import NiftiLabelsMasker
+        if args.atlas != "fsaverage5" and args.atlas != 'hcp' :
             masker = NiftiLabelsMasker(labels_img=atlas.maps, standardize=True,
                                        memory='nilearn_cache')
             time_series = masker.fit_transform(imgs)
-            correlation = ConnectivityMeasure(kind='correlation')
-            time_series = correlation.fit_transform([time_series])[0]
-            plotting.plot_matrix(time_series, figure=(10, 8))
-            plt.savefig(op.join(workdir, 'correlation_matrix.png'))
-            plt.close()
+
         else:
-            fsaverage = fetch_surf_fsaverage(mesh='fsaverage5')
-            surf_lh = surface.vol_to_surf(imgs, fsaverage.pial_left, radius=6.0, interpolation='nearest', kind='ball', n_samples=None, mask_img=dset.masker.mask_img)
-            surf_rh = surface.vol_to_surf(imgs, fsaverage.pial_right, radius=6.0, interpolation='nearest', kind='ball', n_samples=None, mask_img=dset.masker.mask_img)
-            time_series = np.transpose(np.vstack((surf_lh, surf_rh)))
-            correlation = ConnectivityMeasure(kind='correlation')
-            time_series = correlation.fit_transform([time_series])[0]
-            plotting.plot_matrix(time_series, figure=(10, 8))
-            plt.savefig(op.join(workdir, 'correlation_matrix.png'))
-            plt.close()
+            if args.atlas == 'fsaverage5':
+                fsaverage = fetch_surf_fsaverage(mesh='fsaverage5')
+                pial_left = fsaverage.pial_left
+                pial_right = fsaverage.pial_right
+                medial_wall_inds_left = surface.load_surf_data('./templates/lh.Medial_wall.label')
+                medial_wall_inds_right = surface.load_surf_data('./templates/rh.Medial_wall.label')
+                sulc_left = fsaverage.sulc_left
+                sulc_right = fsaverage.sulc_right
 
+            elif args.atlas == 'hcp':
+                pial_left = './templates/S1200.L.pial_MSMAll.32k_fs_LR.surf.gii'
+                pial_right = './templates/S1200.R.pial_MSMAll.32k_fs_LR.surf.gii'
+                medial_wall_inds_left = np.where(nib.load('./templates/hcp.tmp.lh.dscalar.nii').get_fdata()[0] == 0)[0]
+                medial_wall_inds_right = np.where(nib.load('./templates/hcp.tmp.rh.dscalar.nii').get_fdata()[0] == 0)[0]
+                left_verts = 32492-len(medial_wall_inds_left)
+                sulc_left = nib.load('./templates/S1200.sulc_MSMAll.32k_fs_LR.dscalar.nii').get_fdata()[0][0:left_verts]*-1
+                sulc_left = utils.insert(sulc_left, medial_wall_inds_left)
+                sulc_right = nib.load('./templates/S1200.sulc_MSMAll.32k_fs_LR.dscalar.nii').get_fdata()[0][left_verts:]*-1
+                sulc_right = utils.insert(sulc_right, medial_wall_inds_right)
 
-    print('Performing gradient analysis')
+            surf_lh = surface.vol_to_surf(imgs, pial_left, radius=6.0, interpolation='nearest', kind='ball', n_samples=None, mask_img=dset.masker.mask_img)
+            surf_rh = surface.vol_to_surf(imgs, pial_right, radius=6.0, interpolation='nearest', kind='ball', n_samples=None, mask_img=dset.masker.mask_img)
+            lh_vertices_total = np.shape(surf_lh)[0]
+            rh_vertices_total = np.shape(surf_rh)[0]
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write('{0} vertices in left hemisphere after conversion to {1} surface space\n'.format(lh_vertices_total, args.atlas))
+                fo.write('{0} vertices in right hemisphere after conversion to {1} surface space\n'.format(rh_vertices_total, args.atlas))
 
-    optimal_grad_all = []
-    lambdas_all = []
-    grads_all = []
+            #calculate an ALE image of studies
+            surf_ale_array_lh = 1.0 - np.prod(1.0 - surf_lh, axis=1)
+            surf_ale_array_rh = 1.0 - np.prod(1.0 - surf_rh, axis=1)
 
-    affinity_name = 'affinity-{0}'.format(args.affinity_kernel)
-    approach_name = 'approach-{0}'.format(args.approach)
-    colormap = np.transpose(np.vstack((np.linspace(0,1,10, endpoint=False), np.linspace(1,0,10, endpoint=False), np.linspace(0,1,10, endpoint=False))))
-    fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, figsize=(8, 8))
-    ax1.set_xlabel('Component Nb')
-    ax1.set_xlabel('Optimal Components')
+            #create dictionary for plotting (should change key for [0] and [1])
+            ale_dict = {'grads_lh': np.expand_dims(surf_ale_array_lh, axis=1),
+                         'grads_rh': np.expand_dims(surf_ale_array_rh, axis=1),
+                         'pial_left': pial_left,
+                         'sulc_left': sulc_left,
+                         'pial_right': pial_right,
+                         'sulc_right': sulc_right}
 
-    if args.components is not None:
-        components = int(args.components)
+            del surf_ale_array_lh, surf_ale_array_rh
+
+            utils.plot_surfaces(ale_dict, 0, workdir, 'ale', normalize=False, cmap='nipy_spectral')
+            im_list = [op.join(workdir, 'ale-0_left_lateral.png'),
+                       op.join(workdir, 'ale-0_left_medial.png'),
+                       op.join(workdir, 'ale-0_right_medial.png'),
+                       op.join(workdir, 'ale-0_right_lateral.png')]
+            utils.combine_plots(im_list, op.join(workdir, 'ale.png') )
+
+            if args.subcort:
+                surf_lh = np.delete(surf_lh, medial_wall_inds_left, axis=0)
+                surf_rh = np.delete(surf_rh, medial_wall_inds_right, axis=0)
+                lh_vertices_wo_medial_wall = np.shape(surf_lh)[0]
+                rh_vertices_wo_medial_wall = np.shape(surf_rh)[0]
+                with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                    fo.write('{0} vertices in left hemisphere after removing {1} left medial wall vertices\n'.format(lh_vertices_wo_medial_wall, len(medial_wall_inds_left)))
+                    fo.write('{0} vertices in right hemisphere after removing {1} right medial wall vertices\n'.format(rh_vertices_wo_medial_wall, len(medial_wall_inds_right)))
+
+                with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                    fo.write('adding subcortical voxels\n')
+                subcort_img = nib.load('templates/rois-subcortical_mni152_mask.nii.gz')
+                subcort_ts = masking.apply_mask(imgs, mask_img=subcort_img)
+                num_subcort_vox = np.shape(subcort_ts)[1]
+                with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                    fo.write('Adding time-series for {} sub-cortical voxels\n'.format(num_subcort_vox))
+                time_series = np.hstack((np.transpose(np.vstack((surf_lh, surf_rh))), subcort_ts))
+
+                del subcort_ts
+
+            else:
+                time_series = np.transpose(np.vstack((surf_lh, surf_rh)))
+
+            del imgs, surf_lh, surf_rh
+
+        with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+            fo.write('Matrix contains {0} voxels/vertices across {1} MA images\n'.format(np.shape(time_series)[1], np.shape(time_series)[0]))
+        time_series = time_series.astype('float32')
+
+        inds_discard = np.append(np.where(np.isnan(np.mean(time_series, axis=0)) == True)[0], np.where(np.any(time_series, axis=0) == False)[0])
+        if inds_discard.any():
+            time_series = np.delete(time_series, inds_discard, axis=1)
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write('removing {} vertices and voxels without MA values\n'.format(len(inds_discard)))
+                fo.write('Matrix contains {0} voxels/vertices across {1} MA images\n'.format(np.shape(time_series)[1], np.shape(time_series)[0]))
+
+        with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+            fo.write('calculating correlation matrix\n')
+        correlation = ConnectivityMeasure(kind='correlation')
+        time_series = correlation.fit_transform([time_series])[0]
+
+        if args.affinity == "cosine":
+            with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+                fo.write('calculating affinity matrix\n')
+            time_series = utils.affinity(time_series, 10*args.sparsity)
+            with open(op.join(workdir, 'affinity-matrix.p'), 'wb') as fo:
+                pickle.dump(time_series, fo, protocol=4)
+
+    with open(op.join(workdir, 'analysis-information.txt'), 'a+') as fo:
+        fo.write('Performing gradient analysis\n')
+
+    gradients, statistics = embed.compute_diffusion_map(time_series, alpha = 0.5, return_result=True, overwrite=True)
+    pickle.dump(statistics, open(op.join(workdir, 'statistics.p'), "wb"))
+
+    # putting vertices w/o time-series information back in gradients with value=0
+    if inds_discard.any():
+        gradients = utils.insert(gradients, inds_discard)
+
+    # if subcortical included in gradient decomposition, remove gradient scores
+    if args.subcort:
+        subcort_grads = gradients[np.shape(gradients)[0]-num_subcort_vox:,:]
+        gradients = gradients[0:np.shape(gradients)[0]-num_subcort_vox,:]
+
+        # get left hemisphere gradient scores, and insert 0's where medial wall is
+        gradients_lh = gradients[0:lh_vertices_wo_medial_wall,:]
+        gradients_lh = utils.insert(gradients_lh, medial_wall_inds_left)
+
+        # get right hemisphere gradient scores and insert 0's where medial wall is
+        gradients_rh = gradients[-rh_vertices_wo_medial_wall:,:]
+        gradients_rh = utils.insert(gradients_rh, medial_wall_inds_right)
+
     else:
-        components = 10
+        gradients_lh = gradients[0:int(np.shape(gradients)[0]/2),:]
+        gradients_rh = gradients[int(np.shape(gradients)[0]/2):,:]
 
-    if args.atlas is not None:
-        for i, tmp_thresh in enumerate(range(9,10,1)):
-            tmp_thresh = tmp_thresh/10
-            gm = GradientMaps(n_components=components, random_state=0, kernel=args.affinity_kernel, approach=args.approach)
-            gm.fit(time_series, sparsity=tmp_thresh)
+    grad_dict = {'grads_lh': gradients_lh,
+                 'grads_rh': gradients_rh,
+                 'pial_left': pial_left,
+                 'sulc_left': sulc_left,
+                 'pial_right': pial_right,
+                 'sulc_right': sulc_right}
+    if args.subcort:
+        grad_dict['subcort_grads'] = subcort_grads
+    pickle.dump(grad_dict, open(op.join(workdir, 'gradients.p'), "wb"))
 
-            ax1.set_ylabel('Eigenvalue')
-            ax2.set_ylabel('Difference in Eigenvalue')
-            ax1.scatter(range(1,gm.lambdas_.size+1,1), gm.lambdas_, c=colormap[i,:], label='sparsity: {0}'.format(tmp_thresh))
+    #find the number of components that explain at least 50% variance
+    n_components = np.where(np.cumsum(statistics['lambdas']/np.sum(statistics['lambdas'])) > 0.5)[0][0]+1
+    vectors = np.zeros((np.shape(statistics['vectors'])[0], n_components))
+    for i in np.arange(1,n_components+1):
+        vectors[:,i-1] = statistics['vectors'][:,i]/statistics['vectors'][:,0]
 
-            gm_lambdas_diff = gm.lambdas_[:-1] - gm.lambdas_[1:]
-            ax2.scatter(range(1,gm.lambdas_.size,1), gm_lambdas_diff, c=colormap[i,:], label='sparsity: {0}'.format(tmp_thresh))
-            print(gm_lambdas_diff)
-            print(gm.lambdas_)
-            print(gm.gradients_)
-            optimal_num_gradients = np.where(gm_lambdas_diff == np.max(gm_lambdas_diff))[0][0] + 1
+    # putting vertices w/o time-series information back in gradients with value=0
+    if inds_discard.any():
+        vectors = utils.insert(vectors, inds_discard)
 
-            lambdas_all.append(gm.lambdas_)
-            optimal_grad_all.append(optimal_num_gradients)
-            grads_all.append(gm.gradients_)
-            print(np.max(gm.gradients_))
+    # if subcortical included in gradient decomposition, remove gradient scores
+    if args.subcort:
+        subcort_grads = vectors[np.shape(vectors)[0]-num_subcort_vox:,:]
+        vectors = vectors[0:np.shape(vectors)[0]-num_subcort_vox,:]
 
-            print('Optimal number of gradients is {0} for sparsity {1}'.format(optimal_num_gradients, tmp_thresh))
+        # get left hemisphere gradient scores, and insert 0's where medial wall is
+        vectors_lh = vectors[0:lh_vertices_wo_medial_wall,:]
+        vectors_lh = utils.insert(vectors_lh, medial_wall_inds_left)
 
-            ax1.legend()
-            ax2.legend()
+        # get right hemisphere gradient scores and insert 0's where medial wall is
+        vectors_rh = vectors[-rh_vertices_wo_medial_wall:,:]
+        vectors_rh = utils.insert(vectors_rh, medial_wall_inds_right)
 
     else:
-        gm = GradientMaps(n_components=components, random_state=0, kernel=args.affinity_kernel, approach=args.approach)
-        gm.fit(time_series, sparsity=None)
-        ax1.set_ylabel('Explained Variance Ratio')
-        ax2.set_ylabel('Difference in Explained Variance Ratio')
-        ax1.scatter(range(1,gm.lambdas_.size+1,1), (100*gm.lambdas_)/gm.lambdas_.sum())
-        gm_lambdas_diff = 100*(gm.lambdas_[:-1] - gm.lambdas_[1:])/gm.lambdas_.sum()
-        ax2.scatter(range(1,gm.lambdas_.size,1), gm_lambdas_diff)
+        vectors_lh = vectors[0:int(np.shape(vectors)[0]/2),:]
+        vectors_rh = vectors[int(np.shape(vectors)[0]/2):,:]
 
-        optimal_num_gradients = np.where(gm_lambdas_diff == np.max(gm_lambdas_diff))[0][0] + 1
-        #optimal_num_gradients = np.max(np.where((100*gm.lambdas_)/gm.lambdas_.sum() > 10)) + 1
-
-        lambdas_all.append(gm.lambdas_)
-        optimal_grad_all.append(optimal_num_gradients)
-        grads_all.append(gm.gradients_)
-
-        print('Optimal number of gradients is {0}'.format(optimal_num_gradients))
-
-    plt.savefig(op.join(workdir, 'lambdas.png'))
-    pickle.dump(grads_all, open(op.join(workdir, 'gradients.p'), "wb"))
-
-    lambdas_all = np.asarray(lambdas_all)
-
-    from scipy import stats
-    if args.components is None:
-        mode_optimal_num_gradients = stats.mode(optimal_grad_all).mode[0]
-    else:
-        mode_optimal_num_gradients = int(args.components)
-    gradients_name = 'gradients-{0}'.format(mode_optimal_num_gradients)
-    print('The most consistent number of optimal gradients is {0} across all sparsity assesments'.format(mode_optimal_num_gradients))
-
-    if args.atlas is not None:
-        if args.sparsity is None:
-            maxvar_sparsity = np.where(lambdas_all[:,mode_optimal_num_gradients-1] == np.max(lambdas_all[:,mode_optimal_num_gradients-1]))[0][0]
-        else:
-            maxvar_sparsity = args.sparsity
-        optimal_grads = grads_all[maxvar_sparsity]
-        sparsity_name = 'sparsity-{0}'.format(maxvar_sparsity/10)
-        print('Optimal sparsity is {0}'.format(maxvar_sparsity/10))
-    else:
-        optimal_grads = grads_all[0]
-        sparsity_name = 'sparsity-None'
+    vectors_dict = {'grads_lh': vectors_lh,
+                 'grads_rh': vectors_rh,
+                 'pial_left': pial_left,
+                 'sulc_left': sulc_left,
+                 'pial_right': pial_right,
+                 'sulc_right': sulc_right}
+    if args.subcort:
+        vectors_dict['subcort_grads'] = subcort_grads
+    pickle.dump(vectors_dict, open(op.join(workdir, 'vectors.p'), "wb"))
 
     # map the gradient to the parcels
-    for i in range(mode_optimal_num_gradients):
+    for i in range(np.shape(vectors)[1]):
         if args.atlas is not None:
-            if args.atlas == 'surface':
-                plotting.plot_surf_stat_map(fsaverage.pial_left, optimal_grads[0:int(np.shape(optimal_grads)[0]/2),i], hemi='left', bg_map=fsaverage.sulc_left, bg_on_data = True, colorbar=False, view='medial', cmap='jet',  output_file=op.join(workdir, 'gradient-{0}_left_medial.png'.format(i)))
-                plotting.plot_surf_stat_map(fsaverage.pial_right, optimal_grads[int(np.shape(optimal_grads)[0]/2):,i], hemi='right', bg_map=fsaverage.sulc_right, bg_on_data = True, colorbar=False, view='medial', cmap='jet', output_file=op.join(workdir, 'gradient-{0}_right_medial.png'.format(i)))
-                plotting.plot_surf_stat_map(fsaverage.pial_left, optimal_grads[0:int(np.shape(optimal_grads)[0]/2),i], hemi='left', bg_map=fsaverage.sulc_left, bg_on_data = True, colorbar=False, view='lateral', cmap='jet', output_file=op.join(workdir, 'gradient-{0}_left_lateral.png'.format(i)))
-                plotting.plot_surf_stat_map(fsaverage.pial_right, optimal_grads[int(np.shape(optimal_grads)[0]/2):,i], hemi='right', bg_map=fsaverage.sulc_right, bg_on_data = True, colorbar=True, view='lateral', cmap='jet', output_file=op.join(workdir, 'gradient-{0}_right_lateral.png'.format(i)))
+            if args.atlas == 'fsaverage5' or args.atlas =='hcp':
+
+                utils.plot_surfaces(vectors_dict, i, workdir, 'gradient', normalize=False)
+                im_list = [op.join(workdir, 'gradient-{}_left_lateral.png'.format(i)),
+                           op.join(workdir, 'gradient-{}_left_medial.png'.format(i)),
+                           op.join(workdir, 'gradient-{}_right_medial.png'.format(i)),
+                           op.join(workdir, 'gradient-{}_right_lateral.png'.format(i))]
+                utils.combine_plots(im_list, op.join(workdir, 'gradient-{0}.png'.format(i)))
+
+                if args.subcort:
+                    tmpimg = masking.unmask(subcort_grads[:,i], subcort_img)
+                    nib.save(tmpimg, op.join(workdir, 'gradient-{0}.nii.gz'.format(i)))
             else:
                 tmpimg = np.zeros(atlas_shape)
                 for j, n in enumerate(np.unique(atlas_data)[1:]):
                     inds = atlas_data == n
-                    tmpimg[inds] = optimal_grads[j,i]
+                    tmpimg[inds] = gradients[j,i]
                     nib.save(nib.Nifti1Image(tmpimg, atlas_affine), op.join(workdir, 'gradient-{0}.nii.gz'.format(i)))
         else:
             tmpimg = np.zeros(np.prod(dset.masker.mask_img.shape))
             inds = np.ravel_multi_index(np.nonzero(dset.masker.mask_img.get_fdata()), dset.masker.mask_img.shape)
-            tmpimg[inds] = optimal_grads[:,i]
+            tmpimg[inds] = gradients[:,i]
             nib.save(nib.Nifti1Image(np.reshape(tmpimg, dset.masker.mask_img.shape), dset.masker.mask_img.affine), op.join(workdir, 'gradient-{0}.nii.gz'.format(i)))
+            #include a command for surface plots, if desired
 
-        if args.atlas != 'surface':
-            os.system('python3 /Users/miriedel/Desktop/GitHub/surflay/make_figures.py '
-                  '-f {grad_image} --colormap jet -z 36 8 0 -24'.format(grad_image = op.join(workdir, 'gradient-{0}.nii.gz'.format(i))))
 
-    output_dir = op.join(args.outdir, '{dataset_name}_{atlas_name}_{kernel_name}_{sparsity_name}_{gradients_name}_{affinity_name}_{approach_name}'.format(
+    output_dir = op.join(args.outdir, '{dataset_name}_{atlas_name}_{kernel_name}_{sparsity_name}_{gradients_name}_{affinity_name}_{approach_name}_{subcortical_name}'.format(
                                         dataset_name=dataset_name,
                                         atlas_name=atlas_name,
                                         kernel_name=kernel_name,
                                         sparsity_name=sparsity_name,
                                         gradients_name=gradients_name,
                                         affinity_name=affinity_name,
-                                        approach_name=approach_name))
-    os.makedirs(output_dir, exist_ok=True)
-    os.rename(workdir, output_dir)
+                                        approach_name=approach_name,
+                                        subcortical_name=subcortical_name))
+
+    shutil.copytree(workdir, output_dir)
+
+    shutil.rmtree(workdir)
 
 
 if __name__ == '__main__':
