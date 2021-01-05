@@ -338,47 +338,13 @@ def main(argv=None):
 
     #find the number of components that explain at least 50% variance
     n_components = np.where(np.cumsum(statistics['lambdas']/np.sum(statistics['lambdas'])) > 0.5)[0][0]+1
-    vectors = np.zeros((np.shape(statistics['vectors'])[0], n_components))
-    for i in np.arange(1,n_components+1):
-        vectors[:,i-1] = statistics['vectors'][:,i]/statistics['vectors'][:,0]
-
-    # putting vertices w/o time-series information back in gradients with value=0
-    if inds_discard.any():
-        vectors = utils.insert(vectors, inds_discard)
-
-    # if subcortical included in gradient decomposition, remove gradient scores
-    if args.subcort:
-        subcort_grads = vectors[np.shape(vectors)[0]-num_subcort_vox:,:]
-        vectors = vectors[0:np.shape(vectors)[0]-num_subcort_vox,:]
-
-        # get left hemisphere gradient scores, and insert 0's where medial wall is
-        vectors_lh = vectors[0:lh_vertices_wo_medial_wall,:]
-        vectors_lh = utils.insert(vectors_lh, medial_wall_inds_left)
-
-        # get right hemisphere gradient scores and insert 0's where medial wall is
-        vectors_rh = vectors[-rh_vertices_wo_medial_wall:,:]
-        vectors_rh = utils.insert(vectors_rh, medial_wall_inds_right)
-
-    else:
-        vectors_lh = vectors[0:int(np.shape(vectors)[0]/2),:]
-        vectors_rh = vectors[int(np.shape(vectors)[0]/2):,:]
-
-    vectors_dict = {'grads_lh': vectors_lh,
-                 'grads_rh': vectors_rh,
-                 'pial_left': pial_left,
-                 'sulc_left': sulc_left,
-                 'pial_right': pial_right,
-                 'sulc_right': sulc_right}
-    if args.subcort:
-        vectors_dict['subcort_grads'] = subcort_grads
-    pickle.dump(vectors_dict, open(op.join(workdir, 'vectors.p'), "wb"))
 
     # map the gradient to the parcels
-    for i in range(np.shape(vectors)[1]):
+    for i in range(n_components):
         if args.atlas is not None:
             if args.atlas == 'fsaverage5' or args.atlas =='hcp':
 
-                utils.plot_surfaces(vectors_dict, i, workdir, 'gradient', normalize=False)
+                utils.plot_surfaces(grad_dict, i, workdir, 'gradient', normalize=False)
                 im_list = [op.join(workdir, 'gradient-{}_left_lateral.png'.format(i)),
                            op.join(workdir, 'gradient-{}_left_medial.png'.format(i)),
                            op.join(workdir, 'gradient-{}_right_medial.png'.format(i)),
