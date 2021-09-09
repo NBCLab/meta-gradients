@@ -1,11 +1,13 @@
+"""Miscellaneous utility functions."""
 import os
 import os.path as op
-from PIL import Image
+
 import numpy as np
-from sklearn.metrics import pairwise_distances
-from nilearn import plotting
 from neurosynth.base.dataset import download
+from nilearn import plotting
 from nimare.io import convert_neurosynth_to_dataset
+from PIL import Image
+from sklearn.metrics import pairwise_distances
 
 
 def crop_image(image_fname):
@@ -33,7 +35,7 @@ def insert(matrix, indices):
     return matrix
 
 
-def affinity(matrix, sparsity):
+def calculate_affinity(matrix, sparsity):
     # Generate percentile thresholds for 90th percentile
     perc = np.array([np.percentile(x, sparsity) for x in matrix])
 
@@ -138,8 +140,9 @@ def combine_plots(list_im, fname_out):
         crop_image(i)
 
     imgs = [Image.open(i) for i in list_im]
-    # pick the image which is the smallest, and resize the others to match it (can be arbitrary image shape here)
-    min_shape = sorted([(np.sum(i.size), i.size) for i in imgs])[0][1]
+    # pick the image which is the smallest, and resize the others to match it
+    # (can be arbitrary image shape here)
+    # min_shape = sorted([(np.sum(i.size), i.size) for i in imgs])[0][1]  # unused
     imgs_comb = np.hstack(
         (
             np.asarray(i.resize((int(i.size[0] * i.size[1] / imgs[3].size[1]), imgs[3].size[1])))

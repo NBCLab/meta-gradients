@@ -84,7 +84,7 @@ def plot_surfaces(grad_dict, index, outdir):
     )
 
 
-def affinity(matrix, sparsity):
+def calculate_affinity(matrix, sparsity):
     # Generate percentile thresholds for 90th percentile
     perc = np.array([np.percentile(x, sparsity) for x in matrix])
     # Threshold each row of the matrix by setting values below 90th percentile to 0
@@ -532,7 +532,7 @@ def main(
                 print(np.shape(time_series))
 
                 if affinity == "cosine":
-                    time_series = affinity(time_series, 10 * sparsity)
+                    time_series = calculate_affinity(time_series, 10 * sparsity)
 
             else:
                 time_series = np.transpose(k.transform(dset, return_type="array"))

@@ -467,7 +467,7 @@ def main(
         if affinity == "cosine":
             with open(op.join(workdir, "analysis-information.txt"), "a+") as fo:
                 fo.write("calculating affinity matrix\n")
-            time_series = utils.affinity(time_series, 10 * sparsity)
+            time_series = utils.calculate_affinity(time_series, 10 * sparsity)
             with open(op.join(workdir, "affinity-matrix.p"), "wb") as fo:
                 pickle.dump(time_series, fo, protocol=4)
 
